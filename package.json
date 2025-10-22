@@ -1,0 +1,20 @@
+{
+  "name": "nexus-proxy",
+  "version": "1.0.0",
+  "description": "SOCKS5 proxy server with UDP ASSOCIATE support for HTTP/3 QUIC and gaming",
+  "main": "script.js",
+  "scripts": {
+    "start": "node script.js"
+  },
+  "keywords": ["socks5", "proxy", "udp", "quic", "http3", "nexus"],
+  "author": "Sourav Kalal/InterceptSuite",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/InterceptSuite/nexus-proxy.git"
+  },
+  "homepage": "https://github.com/InterceptSuite/nexus-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/InterceptSuite/nexus-proxy/issues"
+  }
+}
