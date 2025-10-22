@@ -17,6 +17,14 @@ This project was created to test UDP proxy support in [ProxyBridge](https://gith
 ## Installation
 
 ```bash
+npm install -g nexus-proxy
+```
+
+Or for development:
+
+```bash
+git clone https://github.com/InterceptSuite/nexus-proxy.git
+cd nexus-proxy
 npm install
 ```
 
