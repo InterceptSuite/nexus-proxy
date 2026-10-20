@@ -1,51 +1,218 @@
 const net = require('net');
 const dgram = require('dgram');
+const dns = require('dns');
 
-const args = process.argv.slice(2);
-const config = {
-  host: '127.0.0.1',
-  port: 1080,
-  username: null,
-  password: null,
-  verbose: false
-};
+// ---- command line -------------------------------------------------------------------------------------------------------------
 
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--host' || args[i] === '-h') {
-    config.host = args[++i];
-  } else if (args[i] === '--port' || args[i] === '-p') {
-    config.port = parseInt(args[++i]);
-  } else if (args[i] === '--username' || args[i] === '-u') {
-    config.username = args[++i];
-  } else if (args[i] === '--password' || args[i] === '-P') {
-    config.password = args[++i];
-  } else if (args[i] === '--verbose' || args[i] === '-v') {
-    config.verbose = true;
-  } else if (args[i] === '--help') {
-    console.log(`Usage: node script.js [options]
+const HELP = `Usage: node script.js [options]
 Options:
   -h, --host <ip>        Bind IP address (default: 127.0.0.1)
   -p, --port <port>      SOCKS5 port (default: 1080)
-  -u, --username <user>  Authentication username (optional)
-  -P, --password <pass>  Authentication password (optional)
+  -u, --username <user>  Authentication username (optional, needs --password)
+  -P, --password <pass>  Authentication password (optional, needs --username)
   -v, --verbose          Enable detailed logging
-  --help                 Show this help message`);
-    process.exit(0);
+  --max-per-ip <n>       Maximum simultaneous connections from one client address (default: 500)
+  --help                 Show this help message`;
+
+function parseArgs(args) {
+  const config = {
+    host: '127.0.0.1',
+    port: 1080,
+    username: null,
+    password: null,
+    verbose: false,
+    maxPerIp: 500
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--host' || args[i] === '-h') {
+      config.host = args[++i];
+    } else if (args[i] === '--port' || args[i] === '-p') {
+      config.port = parseInt(args[++i]);
+    } else if (args[i] === '--username' || args[i] === '-u') {
+      config.username = args[++i];
+    } else if (args[i] === '--password' || args[i] === '-P') {
+      config.password = args[++i];
+    } else if (args[i] === '--verbose' || args[i] === '-v') {
+      config.verbose = true;
+    } else if (args[i] === '--max-per-ip') {
+      config.maxPerIp = parseInt(args[++i]);
+    } else if (args[i] === '--help') {
+      config.help = true;
+    }
+  }
+
+  // Authentication needs both values: with only one of them the proxy would silently run open.
+  if ((config.username === null) !== (config.password === null)) {
+    throw new Error('--username and --password must be given together');
+  }
+  if (!Number.isInteger(config.maxPerIp) || config.maxPerIp < 1) {
+    throw new Error('--max-per-ip must be a positive number');
+  }
+  return config;
+}
+
+// ---- addresses ----------------------------------------------------------------------------------------------------------------
+
+// '::ffff:1.2.3.4' (an IPv4 address seen through a dual-stack socket) -> '1.2.3.4'
+function stripMapped(address) {
+  return typeof address === 'string' ? address.replace(/^::ffff:/i, '') : address;
+}
+
+function ipv4ToBuffer(address) {
+  return Buffer.from(address.split('.').map(Number));
+}
+
+// Any textual IPv6 address ('::1', '2606:4700::6810:7b60', '::ffff:1.2.3.4', 'fe80::1%eth0') -> 16 bytes
+function ipv6ToBuffer(address) {
+  address = address.split('%')[0];
+  let tail = null;
+  const dot = address.lastIndexOf('.');
+  if (dot !== -1) {                                     // embedded IPv4 in the last 32 bits
+    const colon = address.lastIndexOf(':');
+    tail = ipv4ToBuffer(address.slice(colon + 1));
+    address = address.slice(0, colon + 1) + '0:0';
+  }
+  const halves = address.split('::');
+  const parse = (s) => (s === '' ? [] : s.split(':').map((p) => parseInt(p, 16)));
+  const head = parse(halves[0]);
+  const rest = halves.length > 1 ? parse(halves[1]) : [];
+  const groups = halves.length > 1 ? head.concat(new Array(8 - head.length - rest.length).fill(0), rest) : head;
+  const out = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) out.writeUInt16BE((groups[i] || 0) & 0xffff, i * 2);
+  if (tail) tail.copy(out, 12);
+  return out;
+}
+
+function bufferToIPv6(buf) {
+  const parts = [];
+  for (let i = 0; i < 16; i += 2) parts.push(buf.readUInt16BE(i).toString(16));
+  return parts.join(':');
+}
+
+// The one text form of an address that is used as a map key: IPv4 as dotted decimal (also when it arrives as ::ffff:a.b.c.d),
+// IPv6 compressed (RFC 5952, lower case), which is also how Node reports the source of a datagram
+function canonicalAddress(address) {
+  address = stripMapped(address);
+  if (net.isIPv4(address)) return address;
+  const groups = [];
+  const b = ipv6ToBuffer(address);
+  for (let i = 0; i < 16; i += 2) groups.push(b.readUInt16BE(i));
+  let bestStart = -1, bestLen = 0;
+  for (let i = 0; i < 8;) {
+    if (groups[i] !== 0) { i++; continue; }
+    let j = i;
+    while (j < 8 && groups[j] === 0) j++;
+    if (j - i > bestLen) { bestStart = i; bestLen = j - i; }
+    i = j;
+  }
+  const hex = groups.map((g) => g.toString(16));
+  if (bestLen < 2) return hex.join(':');
+  return hex.slice(0, bestStart).join(':') + '::' + hex.slice(bestStart + bestLen).join(':');
+}
+
+// SOCKS5 address field for an IP address string: { atyp, bytes }
+function encodeAddress(address) {
+  address = stripMapped(address);
+  if (net.isIPv4(address)) return { atyp: 0x01, bytes: ipv4ToBuffer(address) };
+  return { atyp: 0x04, bytes: ipv6ToBuffer(address) };
+}
+
+// Length of the ATYP + ADDR + PORT part of a request starting at data[3], or 0 when more bytes are needed, or -1 when the
+// address type is unknown
+function addressLength(data) {
+  if (data.length < 4) return 0;
+  const atyp = data[3];
+  if (atyp === 0x01) return data.length >= 10 ? 7 : 0;
+  if (atyp === 0x04) return data.length >= 22 ? 19 : 0;
+  if (atyp === 0x03) {
+    if (data.length < 5) return 0;
+    return data.length >= 5 + data[4] + 2 ? 4 + data[4] : 0;
+  }
+  return -1;
+}
+
+// Parses ATYP/ADDR/PORT at data[start...]: { host, port, end } (end: index after the port)
+function parseAddress(data, start) {
+  const atyp = data[start];
+  if (atyp === 0x01) {
+    return { host: `${data[start + 1]}.${data[start + 2]}.${data[start + 3]}.${data[start + 4]}`, port: data.readUInt16BE(start + 5), end: start + 7 };
+  }
+  if (atyp === 0x03) {
+    const len = data[start + 1];
+    return { host: len === 0 ? '0.0.0.0' : data.slice(start + 2, start + 2 + len).toString(), port: data.readUInt16BE(start + 2 + len), end: start + 4 + len };
+  }
+  return { host: bufferToIPv6(data.slice(start + 1, start + 17)), port: data.readUInt16BE(start + 17), end: start + 19 };
+}
+
+// SOCKS5 reply codes for a failed outgoing connection
+function replyCodeFor(err) {
+  switch (err && err.code) {
+    case 'ECONNREFUSED': return 0x05;
+    case 'ENETUNREACH': return 0x03;
+    case 'EHOSTUNREACH': case 'ENOTFOUND': case 'EAI_AGAIN': case 'ENODATA': return 0x04;
+    case 'ETIMEDOUT': return 0x06;
+    default: return 0x01;
   }
 }
+
+function reply(code, address, port) {
+  const a = address ? encodeAddress(address) : { atyp: 0x01, bytes: Buffer.alloc(4) };
+  const out = Buffer.alloc(4 + a.bytes.length + 2);
+  out[0] = 0x05;
+  out[1] = code;
+  out[3] = a.atyp;
+  a.bytes.copy(out, 4);
+  out.writeUInt16BE(port || 0, 4 + a.bytes.length);
+  return out;
+}
+
+// ---- QUIC ---------------------------------------------------------------------------------------------------------------------
+
+// A long-header QUIC packet (RFC 9000): form bit and fixed bit set, a version that is known or greased (0x?a?a?a?a), or a
+// Version Negotiation packet (version 0). Anything else (DNS, game traffic, ...) is not reported as QUIC.
+function detectQUICPacket(data) {
+  if (data.length < 7) return false;
+  const first = data[0];
+  if ((first & 0x80) === 0) return false;
+  const version = data.readUInt32BE(1);
+  if (version === 0) return true;
+  if ((first & 0x40) === 0) return false;
+  return version === 1 || version === 0x6b3343cf || (version >>> 8) === 0xff0000 || (version & 0x0f0f0f0f) === 0x0a0a0a0a;
+}
+
+// UDP port 443 is what HTTP/3 uses; 8443 is the usual alternative
+function isHTTP3Port(port) {
+  return port === 443 || port === 8443;
+}
+
+// the address form the relay socket needs: an IPv4 destination on a dual-stack socket is written as ::ffff:a.b.c.d
+function relayAddress(address, udpRelay) {
+  if (udpRelay.relayFamily === 6 && net.isIPv4(address)) return '::ffff:' + address;
+  return address;
+}
+
+// ---- the server ---------------------------------------------------------------------------------------------------------------
 
 class SOCKS5Server {
   constructor(config) {
     this.config = config;
-    this.server = net.createServer();
+    // allowHalfOpen: a client that has sent everything and shut down its sending side must still receive the answer
+    this.server = net.createServer({ allowHalfOpen: true });
     this.server.maxConnections = 10000; // Prevent resource exhaustion
     this.activeConnections = 0;
     this.udpClients = new Map();
     this.connectionsByIP = new Map(); // Track connections per IP
+    this.lastLimitLog = 0;
     this.server.on('connection', this.handleConnection.bind(this));
 
     // Cleanup stale UDP clients every 5 minutes
-    setInterval(() => this.cleanupStaleUDPClients(), 300000);
+    this.cleanupTimer = setInterval(() => this.cleanupStaleUDPClients(), 300000);
+    this.cleanupTimer.unref();
+  }
+
+  log(text) {
+    if (this.config.verbose) console.log(text);
   }
 
   cleanupStaleUDPClients() {
@@ -63,9 +230,14 @@ class SOCKS5Server {
   handleConnection(socket) {
     const ip = socket.remoteAddress;
 
-    // Rate limiting: max 500 connections per IP
+    // Rate limiting: a limited number of connections per client address
     const ipCount = this.connectionsByIP.get(ip) || 0;
-    if (ipCount >= 500) {
+    if (ipCount >= this.config.maxPerIp) {
+      const now = Date.now();
+      if (now - this.lastLimitLog > 5000) {
+        this.lastLimitLog = now;
+        console.error(`[LIMIT] ${ip} already has ${ipCount} connections (--max-per-ip ${this.config.maxPerIp}): refusing`);
+      }
       socket.destroy();
       return;
     }
@@ -73,15 +245,11 @@ class SOCKS5Server {
     this.activeConnections++;
     this.connectionsByIP.set(ip, ipCount + 1);
 
-    if (this.config.verbose) {
-      console.log(`[TCP] ${ip}:${socket.remotePort} (active: ${this.activeConnections})`);
-    }
+    this.log(`[TCP] ${ip}:${socket.remotePort} (active: ${this.activeConnections})`);
 
-    socket.setTimeout(60000); // 60s timeout for handshake
-    socket.once('data', (data) => {
-      socket.setTimeout(0); // Clear timeout after successful handshake
-      this.handleAuthNegotiation(socket, data);
-    });
+    socket.setTimeout(60000); // 60s timeout for the whole handshake
+    socket.on('timeout', () => socket.destroy());
+    this.readHandshake(socket);
 
     socket.on('error', (err) => {
       // Ignore common errors but log critical ones
@@ -101,107 +269,102 @@ class SOCKS5Server {
     });
   }
 
-  handleAuthNegotiation(socket, data) {
-    if (data.length < 3 || data[0] !== 0x05) {
+  // TCP is a byte stream: a message may arrive in pieces, and several messages may arrive together. The handshake therefore
+  // collects bytes until the message of the current step is complete.
+  readHandshake(socket) {
+    const authRequired = this.config.username !== null && this.config.password !== null;
+    let buf = Buffer.alloc(0);
+    let step = 'greeting';
+
+    const fail = () => {
+      socket.removeListener('data', onData);
+      socket.removeListener('end', onEnd);
       socket.end();
-      return;
-    }
+    };
+    // half-open sockets stay open after the client's FIN until we end them: a client that leaves in the middle of the handshake
+    const onEnd = () => fail();
+    socket.once('end', onEnd);
 
-    const authRequired = this.config.username && this.config.password;
-
-    if (authRequired) {
-      const methods = Array.from(data.slice(2, 2 + data[1]));
-      if (!methods.includes(0x02)) {
-        socket.write(Buffer.from([0x05, 0xFF]));
-        socket.end();
-        return;
+    const advance = () => {
+      for (;;) {
+        if (step === 'greeting') {
+          if (buf.length < 2) return;
+          if (buf[0] !== 0x05) return fail();
+          const need = 2 + buf[1];
+          if (buf.length < need) return;
+          const methods = Array.from(buf.slice(2, need));
+          buf = buf.slice(need);
+          if (authRequired) {
+            if (!methods.includes(0x02)) {
+              socket.write(Buffer.from([0x05, 0xFF]));
+              return fail();
+            }
+            socket.write(Buffer.from([0x05, 0x02]));
+            step = 'auth';
+          } else {
+            if (!methods.includes(0x00)) {
+              socket.write(Buffer.from([0x05, 0xFF]));
+              return fail();
+            }
+            socket.write(Buffer.from([0x05, 0x00]));
+            step = 'request';
+          }
+        } else if (step === 'auth') {
+          if (buf.length < 2) return;
+          if (buf[0] !== 0x01) return fail();
+          const ulen = buf[1];
+          if (buf.length < 2 + ulen + 1) return;
+          const plen = buf[2 + ulen];
+          const need = 3 + ulen + plen;
+          if (buf.length < need) return;
+          const username = buf.slice(2, 2 + ulen).toString();
+          const password = buf.slice(3 + ulen, need).toString();
+          buf = buf.slice(need);
+          if (username === this.config.username && password === this.config.password) {
+            socket.write(Buffer.from([0x01, 0x00]));
+            step = 'request';
+          } else {
+            socket.write(Buffer.from([0x01, 0x01]));
+            return fail();
+          }
+        } else {
+          if (buf.length < 4) return;
+          if (buf[0] !== 0x05) return fail();
+          const alen = addressLength(buf);
+          if (alen === 0) return;
+          if (alen < 0) {
+            socket.write(reply(0x08));
+            return fail();
+          }
+          const { host, port } = parseAddress(buf, 3);
+          const cmd = buf[1];
+          const rest = buf.slice(3 + alen);
+          socket.removeListener('data', onData);
+          socket.removeListener('end', onEnd);
+          socket.pause();
+          socket.setTimeout(0);
+          this.handleRequest(socket, cmd, host, port, rest);
+          return;
+        }
       }
-      socket.write(Buffer.from([0x05, 0x02]));
-      socket.once('data', (authData) => {
-        this.handleAuth(socket, authData);
-      });
-    } else {
-      socket.write(Buffer.from([0x05, 0x00]));
-      socket.once('data', (data) => {
-        this.handleRequest(socket, data);
-      });
-    }
+    };
+
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length > 1024) return fail();             // longer than any handshake can be
+      advance();
+    };
+    socket.on('data', onData);
   }
 
-  handleAuth(socket, data) {
-    if (data.length < 3 || data[0] !== 0x01) {
-      socket.end();
-      return;
-    }
-
-    const usernameLen = data[1];
-    const username = data.slice(2, 2 + usernameLen).toString();
-    const passwordLen = data[2 + usernameLen];
-    const password = data.slice(3 + usernameLen, 3 + usernameLen + passwordLen).toString();
-
-    if (username === this.config.username && password === this.config.password) {
-      socket.write(Buffer.from([0x01, 0x00]));
-      socket.once('data', (data) => {
-        this.handleRequest(socket, data);
-      });
-    } else {
-      socket.write(Buffer.from([0x01, 0x01]));
-      socket.end();
-    }
-  }
-
-  handleRequest(socket, data) {
-    if (data.length < 4 || data[0] !== 0x05) {
-      socket.end();
-      return;
-    }
-
-    const cmd = data[1];
-    const atyp = data[3];
-    let host, port;
-
-    if (atyp === 0x01) {
-      if (data.length < 10) {
-        socket.end();
-        return;
-      }
-      host = `${data[4]}.${data[5]}.${data[6]}.${data[7]}`;
-      port = data.readUInt16BE(8);
-    } else if (atyp === 0x03) {
-      if (data.length < 5) {
-        socket.end();
-        return;
-      }
-      const domainLength = data[4];
-      if (data.length < 5 + domainLength + 2) {
-        socket.end();
-        return;
-      }
-      host = domainLength === 0 ? '0.0.0.0' : data.slice(5, 5 + domainLength).toString();
-      port = data.readUInt16BE(5 + domainLength);
-    } else if (atyp === 0x04) {
-      if (data.length < 22) {
-        socket.end();
-        return;
-      }
-      const ipv6Parts = [];
-      for (let i = 0; i < 16; i += 2) {
-        ipv6Parts.push(data.readUInt16BE(4 + i).toString(16));
-      }
-      host = ipv6Parts.join(':');
-      port = data.readUInt16BE(20);
-    } else {
-      socket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-      socket.end();
-      return;
-    }
-
+  handleRequest(socket, cmd, host, port, rest) {
     if (cmd === 0x01) {
-      this.handleConnect(socket, host, port);
+      this.handleConnect(socket, host, port, rest);
     } else if (cmd === 0x03) {
       this.handleUDPAssociate(socket, host, port);
+      socket.resume();
     } else {
-      socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      socket.write(reply(0x07));
       socket.end();
     }
   }
@@ -218,61 +381,54 @@ class SOCKS5Server {
   }
 
   isHTTP3Port(port) {
-    // Common HTTP/3 ports: 443 (HTTPS), 80 (HTTP), 8080, 8443
-    return port === 443 || port === 80 || port === 8080 || port === 8443;
+    return isHTTP3Port(port);
   }
 
   detectQUICPacket(data) {
-    // QUIC packets start with specific header flags
-    // Long header: 1xxx xxxx (0x80-0xFF)
-    // Short header: 0xxx xxxx (0x00-0x7F)
-    if (data.length < 1) return false;
-
-    const firstByte = data[0];
-    // Check for QUIC long header (version negotiation, initial, 0-RTT, handshake)
-    if ((firstByte & 0x80) !== 0) {
-      // Long header detected - likely QUIC
-      return true;
-    }
-    // Short header (1-RTT) packets are harder to detect reliably
-    // But we can check for common patterns
-    return false;
+    return detectQUICPacket(data);
   }
 
-  handleConnect(socket, host, port) {
+  handleConnect(socket, host, port, rest) {
     if (this.isBroadcastIP(host)) {
-      socket.write(Buffer.from([0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      socket.write(reply(0x02));
       socket.end();
       return;
     }
 
-    // Performance: larger buffers and disable Nagle's algorithm
+    // Performance: disable Nagle's algorithm
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 60000);
 
-    const targetSocket = net.createConnection(port, host);
+    // allowHalfOpen on both sides: when one side stops sending, the other side is told (pipe forwards the end) but can still
+    // answer until it has finished too
+    let targetSocket;
+    try {
+      targetSocket = net.createConnection({ port, host, allowHalfOpen: true });
+    } catch (e) {                                        // for instance an unusable port
+      socket.write(reply(0x01));
+      socket.end();
+      return;
+    }
     targetSocket.setNoDelay(true);
     targetSocket.setKeepAlive(true, 60000);
+    let connected = false;
 
     targetSocket.on('connect', () => {
-      if (this.config.verbose) {
-        console.log(`[CONNECT] ${host}:${port}`);
-      }
-      socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-
-      // Backpressure handling: pause if buffers fill
-      socket.pipe(targetSocket).on('drain', () => socket.resume());
-      targetSocket.pipe(socket).on('drain', () => targetSocket.resume());
-
-      socket.on('error', () => {
-        targetSocket.destroy();
-      });
+      connected = true;
+      this.log(`[CONNECT] ${host}:${port}`);
+      socket.write(reply(0x00, targetSocket.localAddress, targetSocket.localPort));
+      if (rest && rest.length) targetSocket.write(rest);
+      socket.pipe(targetSocket);
+      targetSocket.pipe(socket);
+      socket.resume();
     });
 
     targetSocket.on('error', (err) => {
-      if (!socket.destroyed) {
-        socket.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      if (!connected && !socket.destroyed) {
+        socket.write(reply(replyCodeFor(err)));
         socket.end();
+      } else {
+        socket.destroy();
       }
     });
 
@@ -280,28 +436,67 @@ class SOCKS5Server {
       if (!socket.destroyed) socket.end();
     });
 
+    socket.on('error', () => {
+      targetSocket.destroy();
+    });
+
     socket.on('close', () => {
       if (!targetSocket.destroyed) targetSocket.destroy();
     });
   }
 
+  // The socket that carries UDP for one association. Dual-stack, so that one socket reaches IPv4 and IPv6 destinations; IPv4
+  // destinations are then addressed as ::ffff:a.b.c.d. Where the host has no IPv6 an IPv4 socket is used instead.
+  createRelay(onError, callback) {
+    const make = (type) => {
+      const relay = dgram.createSocket({ type, reuseAddr: true, ipv6Only: false, recvBufferSize: 4 << 20, sendBufferSize: 4 << 20 });
+      relay.relayFamily = type === 'udp6' ? 6 : 4;
+      relay.on('error', onError);
+      return relay;
+    };
+    let relay = make('udp6');
+    const onBindError = (err) => {
+      if (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL' || err.code === 'EPROTONOSUPPORT') {
+        relay.removeListener('error', onError);
+        relay.close();
+        relay = make('udp4');
+        relay.bind(0, '0.0.0.0', () => callback(relay));
+      }
+    };
+    relay.once('error', onBindError);
+    relay.bind(0, '::', () => {
+      relay.removeListener('error', onBindError);
+      callback(relay);
+    });
+  }
+
   handleUDPAssociate(socket, host, port) {
-    const udpRelay = dgram.createSocket({ type: 'udp6', reuseAddr: true, ipv6Only: false, recvBufferSize: 212992, sendBufferSize: 212992 });
     const clientKey = `${socket.remoteAddress}:${socket.remotePort}`;
+    const clientIp = canonicalAddress(socket.remoteAddress);
+    // RFC 1928: the relay serves the client that asked for it. A port in the request (when not 0) narrows that further.
+    const expectedPort = port || 0;
     const remoteMap = new Map();
     let cleanupTimer = null;
-    const requestedDest = `${host}:${port}`;
+    let closed = false;
 
-    udpRelay.on('error', () => {
-      socket.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+    const failAssociation = () => {
+      if (closed) return;
+      closed = true;
+      if (cleanupTimer) clearInterval(cleanupTimer);
+      this.udpClients.delete(clientKey);
+      remoteMap.clear();
+      try { socket.write(reply(0x01)); } catch (e) { /* the control connection is gone already */ }
       socket.end();
-    });
+    };
 
-    udpRelay.on('message', (msg, rinfo) => {
-      this.handleUDPMessage(msg, rinfo, udpRelay, remoteMap);
-    });
-
-    udpRelay.bind(0, '0.0.0.0', () => {
+    this.createRelay(failAssociation, (udpRelay) => {
+      if (closed || socket.destroyed) {
+        udpRelay.close();
+        return;
+      }
+      udpRelay.on('message', (msg, rinfo) => {
+        this.handleUDPMessage(msg, rinfo, udpRelay, remoteMap, clientIp, expectedPort);
+      });
       const udpPort = udpRelay.address().port;
 
       this.udpClients.set(clientKey, {
@@ -313,23 +508,10 @@ class SOCKS5Server {
         lastActivity: Date.now()
       });
 
-      const serverLocalAddress = socket.localAddress.replace('::ffff:', '');
-      const serverIpParts = serverLocalAddress.split('.');
-      const response = Buffer.alloc(10);
-      response[0] = 0x05;
-      response[1] = 0x00;
-      response[2] = 0x00;
-      response[3] = 0x01;
-      response[4] = parseInt(serverIpParts[0] || 127);
-      response[5] = parseInt(serverIpParts[1] || 0);
-      response[6] = parseInt(serverIpParts[2] || 0);
-      response[7] = parseInt(serverIpParts[3] || 1);
-      response.writeUInt16BE(udpPort, 8);
-      socket.write(response);
+      const serverLocalAddress = stripMapped(socket.localAddress);
+      socket.write(reply(0x00, serverLocalAddress, udpPort));
 
-      if (this.config.verbose) {
-        console.log(`[UDP] ${clientKey} → relay ${serverLocalAddress}:${udpPort}`);
-      }
+      this.log(`[UDP] ${clientKey} → relay ${serverLocalAddress}:${udpPort}`);
 
       cleanupTimer = setInterval(() => {
         const now = Date.now();
@@ -339,30 +521,32 @@ class SOCKS5Server {
           }
         }
       }, 300000);
+      cleanupTimer.unref();
 
-      socket.on('close', () => {
+      const cleanup = () => {
         if (cleanupTimer) clearInterval(cleanupTimer);
+        closed = true;
         this.udpClients.delete(clientKey);
         remoteMap.clear();
-        udpRelay.close();
-      });
-
-      socket.on('error', () => {
-        if (cleanupTimer) clearInterval(cleanupTimer);
-        this.udpClients.delete(clientKey);
-        remoteMap.clear();
-        udpRelay.close();
-      });
+        try { udpRelay.close(); } catch (e) { /* already closed */ }
+      };
+      socket.on('close', cleanup);
+      socket.on('error', cleanup);
+      socket.on('end', () => socket.end());              // the client closed the control connection: the association is over
+      udpRelay.removeListener('error', failAssociation);
+      udpRelay.on('error', () => { /* a failed send never ends the association */ });
     });
   }
 
-  handleUDPMessage(msg, rinfo, udpRelay, remoteMap) {
-    const isFromClient = msg.length >= 10 && msg[0] === 0x00 && msg[1] === 0x00;
-
-    if (isFromClient) {
-      this.handleClientToRemote(msg, rinfo, udpRelay, remoteMap);
-    } else {
+  handleUDPMessage(msg, rinfo, udpRelay, remoteMap, clientIp, expectedPort) {
+    const from = canonicalAddress(rinfo.address);
+    // Who sent it is decided by where it came from, not by what it starts with: a reply of a remote host may begin with any
+    // bytes, including 00 00. Remotes are the addresses this association has sent to; the client is the host that opened the
+    // association. Anything else is not served (this is not an open relay).
+    if (remoteMap.has(`${from}:${rinfo.port}`)) {
       this.handleRemoteToClient(msg, rinfo, udpRelay, remoteMap);
+    } else if (from === clientIp && (expectedPort === 0 || rinfo.port === expectedPort)) {
+      this.handleClientToRemote(msg, rinfo, udpRelay, remoteMap);
     }
   }
 
@@ -377,118 +561,107 @@ class SOCKS5Server {
       }
     }
 
-    const atyp = msg[3];
-    let host, port, dataStart;
-
-    if (atyp === 0x01) {
-      host = `${msg[4]}.${msg[5]}.${msg[6]}.${msg[7]}`;
-      port = msg.readUInt16BE(8);
-      dataStart = 10;
-    } else if (atyp === 0x03) {
-      const domainLength = msg[4];
-      host = msg.slice(5, 5 + domainLength).toString();
-      port = msg.readUInt16BE(5 + domainLength);
-      dataStart = 7 + domainLength;
-    } else if (atyp === 0x04) {
-      if (msg.length < 22) return;
-      const ipv6Parts = [];
-      for (let i = 0; i < 16; i += 2) {
-        ipv6Parts.push(msg.readUInt16BE(4 + i).toString(16));
-      }
-      host = ipv6Parts.join(':');
-      port = msg.readUInt16BE(20);
-      dataStart = 22;
-    } else {
-      return;
-    }
+    const alen = addressLength(msg);
+    if (alen <= 0) return;
+    const { host, port, end } = parseAddress(msg, 3);
 
     if (this.isBroadcastIP(host)) return;
+    if (port < 1) return;                                // dgram.send() throws for port 0
 
-    const data = msg.slice(dataStart);
-    const remoteKey = `${host}:${port}`;
+    const data = msg.slice(end);
+    const isHTTP3Likely = isHTTP3Port(port);
+    const isQUIC = detectQUICPacket(data);
 
-    const isNewDestination = !remoteMap.has(remoteKey);
-    const isHTTP3Likely = this.isHTTP3Port(port);
-    const isQUIC = this.detectQUICPacket(data);
+    this.resolveForRelay(host, (err, address) => {
+      if (err) return;
+      const remoteKey = `${canonicalAddress(address)}:${port}`;
+      const isNewDestination = !remoteMap.has(remoteKey);
 
-    remoteMap.set(remoteKey, {
-      clientAddr: rinfo.address,
-      clientPort: rinfo.port,
-      lastActivity: Date.now(),
-      isHTTP3: isHTTP3Likely || isQUIC
-    });
+      remoteMap.set(remoteKey, {
+        clientAddr: rinfo.address,
+        clientPort: rinfo.port,
+        lastActivity: Date.now(),
+        isHTTP3: isHTTP3Likely || isQUIC
+      });
 
-    if (isNewDestination && this.config.verbose) {
-      let protocol = '';
-      if (isQUIC) {
-        protocol = ' [HTTP/3 QUIC detected]';
-      } else if (isHTTP3Likely) {
-        protocol = ' [likely HTTP/3]';
+      if (isNewDestination && this.config.verbose) {
+        let protocol = '';
+        if (isQUIC) {
+          protocol = ' [HTTP/3 QUIC detected]';
+        } else if (isHTTP3Likely) {
+          protocol = ' [likely HTTP/3]';
+        }
+        console.log(`  └─> ${host}:${port}${protocol}`);
       }
-      console.log(`  └─> ${host}:${port}${protocol}`);
-    }
 
-    udpRelay.send(data, port, host);
+      // a datagram that cannot be delivered is that datagram's problem, not the association's (and never the server's)
+      try {
+        udpRelay.send(data, port, relayAddress(address, udpRelay), () => {});
+      } catch (e) { /* closed relay or an address the socket cannot use */ }
+    });
+  }
+
+  // host name or address from the client -> the address to send to
+  resolveForRelay(host, callback) {
+    if (net.isIP(host)) return callback(null, host);
+    dns.lookup(host, { family: 0 }, (err, address) => callback(err, address));
   }
 
   handleRemoteToClient(msg, rinfo, udpRelay, remoteMap) {
-    const remoteKey = `${rinfo.address}:${rinfo.port}`;
+    const remoteKey = `${canonicalAddress(rinfo.address)}:${rinfo.port}`;
     const clientInfo = remoteMap.get(remoteKey);
 
     if (!clientInfo) return;
 
     clientInfo.lastActivity = Date.now();
 
-    // Detect if IPv4 or IPv6
-    const isIPv6 = rinfo.address.includes(':');
-    let responsePacket;
+    const a = encodeAddress(rinfo.address);
+    const header = Buffer.alloc(4 + a.bytes.length + 2);
+    header[3] = a.atyp;                                  // RSV, RSV, FRAG are 0
+    a.bytes.copy(header, 4);
+    header.writeUInt16BE(rinfo.port, 4 + a.bytes.length);
 
-    if (isIPv6) {
-      // IPv6 response packet
-      responsePacket = Buffer.allocUnsafe(22 + msg.length);
-      responsePacket[0] = 0x00;
-      responsePacket[1] = 0x00;
-      responsePacket[2] = 0x00;
-      responsePacket[3] = 0x04; // ATYP for IPv6
-      
-      const ipv6Parts = rinfo.address.split(':');
-      for (let i = 0; i < 8; i++) {
-        const part = ipv6Parts[i] || '0';
-        responsePacket.writeUInt16BE(parseInt(part, 16), 4 + i * 2);
-      }
-      responsePacket.writeUInt16BE(rinfo.port, 20);
-      msg.copy(responsePacket, 22);
-    } else {
-      // IPv4 response packet
-      responsePacket = Buffer.allocUnsafe(10 + msg.length);
-      responsePacket[0] = 0x00;
-      responsePacket[1] = 0x00;
-      responsePacket[2] = 0x00;
-      responsePacket[3] = 0x01; // ATYP for IPv4
-
-      const ipParts = rinfo.address.split('.');
-      responsePacket[4] = parseInt(ipParts[0]);
-      responsePacket[5] = parseInt(ipParts[1]);
-      responsePacket[6] = parseInt(ipParts[2]);
-      responsePacket[7] = parseInt(ipParts[3]);
-      responsePacket.writeUInt16BE(rinfo.port, 8);
-      msg.copy(responsePacket, 10);
-    }
-
-    udpRelay.send(responsePacket, clientInfo.clientPort, clientInfo.clientAddr);
+    try {
+      udpRelay.send(Buffer.concat([header, msg]), clientInfo.clientPort, clientInfo.clientAddr, () => {});
+    } catch (e) { /* the relay was closed in the meantime */ }
   }
 
   listen(port, host, callback) {
     this.server.listen(port, host, callback);
   }
+
+  close(callback) {
+    clearInterval(this.cleanupTimer);
+    for (const client of this.udpClients.values()) {
+      try { client.udpRelay.close(); } catch (e) { /* already closed */ }
+    }
+    this.server.close(callback);
+  }
 }
 
-const proxy = new SOCKS5Server(config);
-proxy.listen(config.port, config.host, () => {
-  console.log(`SOCKS5 proxy server listening on ${config.host}:${config.port}`);
-  if (config.username) {
-    console.log(`Authentication: enabled (username: ${config.username})`);
-  } else {
-    console.log('Authentication: disabled');
+module.exports = {
+  SOCKS5Server, parseArgs, detectQUICPacket, isHTTP3Port, ipv6ToBuffer, bufferToIPv6, stripMapped, canonicalAddress, encodeAddress, replyCodeFor
+};
+
+if (require.main === module) {
+  let config;
+  try {
+    config = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
   }
-});
+  if (config.help) {
+    console.log(HELP);
+    process.exit(0);
+  }
+  const proxy = new SOCKS5Server(config);
+  proxy.listen(config.port, config.host, () => {
+    console.log(`SOCKS5 proxy server listening on ${config.host}:${config.port}`);
+    if (config.username) {
+      console.log(`Authentication: enabled (username: ${config.username})`);
+    } else {
+      console.log('Authentication: disabled');
+    }
+  });
+}
